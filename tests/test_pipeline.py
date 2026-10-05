@@ -117,3 +117,35 @@ def test_judge_context_guard_before_model_execution(runner, monkeypatch):
     monkeypatch.setattr(runner.model, 'forward', lambda **kwargs: pytest.fail('Oversized input must not run'))
     with pytest.raises(ValueError, match='context|limit|tokens'):
         runner.judge(q, [q], 'coverage')
+
+def test_cached_index_baseline_identical_no_document_reencoding(runner, monkeypatch):
+    fresh = runner.run('query', DOCS, 3, 2, [1,1,1], 10, True)
+    vectors, truncations = zip(*(runner.encode(d['text']) for d in DOCS))
+    index = (torch.stack(vectors), truncations)
+    original = runner.encode
+    calls = []
+    def tracked(text):
+        calls.append(text)
+        return original(text)
+    monkeypatch.setattr(runner, 'encode', tracked)
+    cached = runner.run('query', DOCS, 3, 2, [1,1,1], 10, True, index=index)
+    assert calls == ['query']
+    assert cached['baseline_ids'] == fresh['baseline_ids']
+    assert cached['shortlist'] == fresh['shortlist']
+    with pytest.raises(ValueError, match='count'):
+        runner.run('query', DOCS, 3, 2, [1,1,1], 10, True, index=(index[0][:-1], truncations))
+
+@pytest.mark.parametrize('value',[0.,float('nan'),float('inf')])
+def test_encode_rejects_invalid_vectors(runner,value):
+    with torch.no_grad(): runner.layer.weight.fill_(value)
+    with pytest.raises(ValueError,match='non-finite|zero'): runner.encode('query')
+
+def test_judge_rejects_nonfinite_logits(runner,monkeypatch):
+    from types import SimpleNamespace
+    q,_=runner.encode('query')
+    monkeypatch.setattr(runner.model,'forward',lambda **kwargs:SimpleNamespace(logits=torch.full((1,1,64),float('nan'))))
+    with pytest.raises(ValueError,match='non-finite'): runner.judge(q,[q],'coverage')
+
+def test_cached_index_rejects_nonfinite(runner):
+    with pytest.raises(ValueError,match='non-finite'):
+        runner.run('query',DOCS,3,2,[1,1,1],10,True,index=(torch.full((4,16),float('inf')),[False]*4))

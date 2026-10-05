@@ -67,7 +67,10 @@ class Search:
             hidden = self.model.model(input_ids=inputs, use_cache=False).last_hidden_state
         else:
             hidden = self.layer(inputs)
-        vector = F.normalize(hidden.float().mean(dim=1), dim=-1)[0]
+        pooled = hidden.float().mean(dim=1)
+        if not torch.isfinite(pooled).all() or (pooled.norm(dim=-1) == 0).any():
+            raise ValueError('Encoder produced non-finite or zero embeddings')
+        vector = F.normalize(pooled, dim=-1)[0]
         return vector, clipped
 
     @torch.inference_mode()
@@ -102,19 +105,28 @@ class Search:
         if context_limit is not None and embedded.shape[1] > context_limit:
             raise ValueError('Judge prompt exceeds model context limit; reduce bundle size')
         logits = self.model(inputs_embeds=embedded, attention_mask=torch.ones(embedded.shape[:2], device=self.device, dtype=torch.long), use_cache=False).logits[0, -1].float()
+        if not torch.isfinite(logits).all():
+            raise ValueError('Judge produced non-finite logits')
         label_ids = [label[0] for label in self.labels]
         conditional = logits[label_ids].softmax(dim=0)
         label_mass = logits.softmax(dim=0)[label_ids].sum()
         return {'score': float(conditional[0]), 'yes_no_mass': float(label_mass), 'input_tokens': embedded.shape[1]}
 
-    def run(self, query, documents, top_k, size, weights, max_bundles, baseline_only=False):
+    def run(self, query, documents, top_k, size, weights, max_bundles, baseline_only=False, index=None):
         self.sync()
         start = time.perf_counter()
-        vectors, truncations = zip(*(self.encode(d['text']) for d in documents))
-        matrix = torch.stack(vectors)
+        if index is None:
+            vectors, truncations = zip(*(self.encode(d['text']) for d in documents))
+            matrix = torch.stack(vectors)
+        else:
+            matrix, truncations = index
+            if matrix.shape[0] != len(documents) or len(truncations) != len(documents):
+                raise ValueError('Index must match document count')
         self.sync()
         indexed = time.perf_counter()
         q, qtruncated = self.encode(query)
+        if not torch.isfinite(matrix).all():
+            raise ValueError('Index contains non-finite embeddings')
         scores = matrix @ q
         count = min(top_k, len(documents))
         if not 1 <= size <= count:

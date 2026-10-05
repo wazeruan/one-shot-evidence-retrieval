@@ -2,14 +2,18 @@
 
 Research prototype: shared LLM encoder → masked-by-construction mean pooling and L2 normalization → cosine shortlist → frozen prefill-only judge → final evidence bundle. No retry, no generation, no training loop. Default model: Qwen/Qwen3-4B (under 9B); also accepts compatible Qwen3 sizes or local model paths. One frozen model instance is reused sequentially for encoding and judging.
 
-## Run
+## Remote execution
+
+The primary workflow is now SSH/Slurm: see [remote workflow](docs/remote.md). Supply the account in the submission command. CPU preparation installs dependencies and downloads pinned HotpotQA validation/model snapshots; GPU evaluation runs offline. No remote host or workload has been executed yet.
+
+## Small local example (optional)
 
 ```
 uv sync --locked
 uv run one-shot-evidence-retrieval --documents examples/documents.jsonl --query "Who wrote Silver Orchard and which university did the author attend?" --device mps --output outputs/comparison.json
 ```
 
-First use downloads model weights; allow several GB of storage. Use `--local-files-only` for an already cached model. CPU defaults to FP32; MPS/CUDA use FP16. No cluster submission is provided. Model loading is excluded from timing.
+First use downloads model weights; allow several GB of storage. Use `--local-files-only` for an already cached model. CPU defaults to FP32; MPS/CUDA use FP16. Use the remote workflow for cluster execution. Model loading is excluded from timing.
 
 The comparison returns both cosine-only top-m and judged selection from the SAME top-k pool. `--baseline-only` skips judging. `--top-k 5 --bundle-size 2` evaluates all ten pairs with two judge forwards per pair. This is one-shot search with multiple bundle evaluations, not a single judge call. `--max-bundles` bounds cost. Coverage is set-level. The shortlist is never expanded. The baseline and judged method select the same number of documents, not necessarily equal text-token budgets.
 
@@ -32,3 +36,9 @@ The code only implements forward inference; it does not train an encoder, adapte
 Independent tests use tiny random Transformers to verify plumbing, frozen weights, no decoding, finite scores and candidate boundaries. They do not validate Qwen's semantic judgments or hardware latency.
 
 Sources: https://huggingface.co/Qwen/Qwen3-4B
+
+## Real-data benchmark
+
+`python -m one_shot_evidence_retrieval.benchmark prepare` creates a shared corpus from the contexts of a seeded HotpotQA validation sample. The dataset/model revisions and data hashes are recorded. `evaluate` builds embeddings once, searches the shared corpus for every query, and compares baseline with judged bundles. Gold answers and supporting IDs are never passed into the judge. Each completed query is saved atomically; explicit compatible resume reuses those results.
+
+Metrics include gold supporting-document recall, precision, complete coverage, shortlist coverage ceiling, and latency percentiles. These are document-level evidence metrics, not factual truth or generated-answer accuracy. The corpus is a sampled context union, not full Wikipedia and not the official per-query distractor protocol. The frozen judge remains unvalidated. Dataset: https://hotpotqa.github.io/ ; hosted data: https://huggingface.co/datasets/hotpotqa/hotpot_qa .
