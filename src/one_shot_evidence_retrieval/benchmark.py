@@ -209,6 +209,8 @@ def evaluate(args):
             result['shortlist_complete_support'] = evidence_metrics([r['id'] for r in result['shortlist']], query['gold_ids'])['complete_support']
             atomic_json(file, result)
         records.append(result)
+        from .graphs import write_graphs
+        write_graphs(out, records, len(queries))
         print(json.dumps({'completed': len(records), 'total': len(queries), 'query_id': query['id']}), flush=True)
     summary = summarize(records)
     atomic_json(out / 'summary.json', summary)

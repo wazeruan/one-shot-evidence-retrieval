@@ -41,3 +41,7 @@ tail -n 100 /absolute/RUN_DIR/logs/evaluate-TIMESTAMP-JOB_ID.err
 The CPU marker is `data/PREPARED.json`; the GPU marker is `results/SUCCEEDED.json`. `results` reports completion only with both application evidence and successful scheduler accounting. Each stage has a separate atomic receipt. Preserve receipts, logs, dataset manifests, and results for reproducibility.
 
 The frozen pooled-vector judge interface remains experimental: successful scheduler execution does not establish that coverage/correctness scores are calibrated or scientifically valid. This workflow measures one-shot retrieval, not training or adaptive retries.
+
+## Progress graphs
+
+GPU evaluation automatically writes `results/progress.html` and `results/progress.json` after every completed query, including resumed queries. Download the standalone HTML and open it in a browser; reload after fetching updates. No server, plotting dependency or external assets are needed. Curves show running evidence recall/complete coverage for both methods, per-query cosine and judging latency, selected-bundle coverage/correctness predictions, and yes/no vocabulary mass. These are evaluation curves: the current project has no training loop or losses. They do not establish factual correctness or calibrated judgment probabilities.

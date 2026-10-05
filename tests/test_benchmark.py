@@ -86,6 +86,8 @@ def test_evaluate_resume_and_no_gold_leakage(tmp_path, monkeypatch):
             assert kwargs['index'][0].shape==(3,2)
             return {'query':query, 'baseline_ids':[docs[0]['id']], 'judge_ids':[docs[0]['id']],
                 'shortlist':[{'id':d['id']} for d in docs],
+                'bundles':[{'combined':.8, 'coverage':{'score':.7,'yes_no_mass':.8},
+                    'correctness':{'score':.9,'yes_no_mass':.8}}],
                 'timing_ms':{'baseline_online':1.,'judge_extra':2.}}
     monkeypatch.setattr(b,'Search',FakeSearch)
     args=SimpleNamespace(data=str(data),output=str(tmp_path/'results'),model='fake',device='cpu',
@@ -95,10 +97,14 @@ def test_evaluate_resume_and_no_gold_leakage(tmp_path, monkeypatch):
     out=tmp_path/'results'
     receipt=json.loads((out/'SUCCEEDED.json').read_text())
     assert receipt['summary_sha256']==b.digest(out/'summary.json')
+    assert json.loads((out/'progress.json').read_text())['query_ids']==['q1','q2']
+    assert 'Completed 2 / 2 queries' in (out/'progress.html').read_text()
     args.resume=True
     calls.clear()
     b.evaluate(args)
     assert calls==[]
+    assert json.loads((out/'progress.json').read_text())['completed']==2
+    assert 'Completed 2 / 2 queries' in (out/'progress.html').read_text()
     args.top_k=2
     with pytest.raises(ValueError,match='configuration mismatch'): b.evaluate(args)
 
