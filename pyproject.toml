@@ -1,0 +1,26 @@
+[project]
+name = "one-shot-evidence-retrieval"
+version = "0.1.0"
+description = "One-shot cosine search with frozen pooled-vector evidence judging"
+readme = "README.md"
+authors = [
+    { name = "Playitcool_", email = "129354153+Playitcooool@users.noreply.github.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.15.0",
+    "torch>=2.14.1",
+    "transformers>=5.18.0",
+]
+
+[project.scripts]
+one-shot-evidence-retrieval = "one_shot_evidence_retrieval:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
