@@ -4,7 +4,7 @@ Research prototype: shared LLM encoder → masked-by-construction mean pooling a
 
 ## Remote execution
 
-The primary workflow is now SSH/Slurm: see [remote workflow](docs/remote.md). Supply the account in the submission command. CPU preparation installs dependencies and downloads pinned HotpotQA validation/model snapshots; GPU evaluation runs offline. No remote host or workload has been executed yet.
+The primary workflow is now SSH/Slurm: see [remote workflow](docs/remote.md). Start with `python3 deploy/scripts/pipeline.py submit --account YOUR_ACCOUNT`. Partition is optional; runs and caches default to `runs/` and `cache/huggingface/` under the project root. CPU preparation installs dependencies and downloads pinned HotpotQA validation/model snapshots; GPU evaluation runs offline. No remote host or workload has been executed yet.
 
 ## Small local example (optional)
 

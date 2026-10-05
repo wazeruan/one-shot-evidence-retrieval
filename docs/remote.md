@@ -2,20 +2,15 @@
 
 This project is ready to copy to an SSH-accessible Slurm cluster. No host, allocation, site policy, or actual GPU run has yet been verified. Before submission, verify the site's account, partition, modules, GPU resource names, network/download policy, and storage policy. `gpu:h100:1` and 128 GB host RAM are configurable defaults, not claims about a particular cluster. Host RAM is separate from GPU VRAM.
 
-Copy the checkout, including its lock file but excluding `.venv`, caches, and outputs, to an approved shared project directory. Supply a site-approved cache directory accessible to both CPU and GPU nodes. The scripts never change scheduler-assigned GPU visibility.
+Copy the checkout, including its lock file but excluding `.venv`, caches, and outputs, to an approved shared project directory. Keep the project on storage accessible to both CPU and GPU nodes. By default runs go under `PROJECT_ROOT/runs/run-TIMESTAMP/` and model/data caches under `PROJECT_ROOT/cache/huggingface/`; both are Git-ignored. The dependency cache also stays under `PROJECT_ROOT/cache/uv/`. Optional `--output` and `--cache-dir` override these locations. The scripts never change scheduler-assigned GPU visibility.
 
 From the remote checkout, one command submits CPU installation/data/model preparation followed by GPU evaluation with an `afterok` dependency:
 
 ```bash
-python3 deploy/scripts/pipeline.py submit \
-  --output /approved/scratch/experiment-001 \
-  --cache-dir /approved/scratch/hf-cache \
-  --account YOUR_ACCOUNT --partition YOUR_PARTITION \
-  --model Qwen/Qwen3-4B --limit 20 \
-  --top-k 5 --bundle-size 2 --max-bundles 30 --max-tokens 2048
+python3 deploy/scripts/pipeline.py submit --account YOUR_ACCOUNT
 ```
 
-The paths and site flags are placeholders: replace them with verified values. `uv` must already be available on compute nodes, either on PATH or through repeated `--module NAME` arguments. CPU preparation performs `uv sync --frozen`, downloads real HotpotQA data and model weights, and saves the pinned preparation manifest. GPU evaluation uses offline cached weights and compares cosine-only retrieval with frozen pooled-vector judging. Installation/downloads happen inside the CPU allocation. No workload runs on the login node.
+Replace `YOUR_ACCOUNT` with your Slurm account. No partition is passed by default; the scheduler uses its configured default. Optional `--partition` remains available. `uv` must already be available on compute nodes, either on PATH or through repeated `--module NAME` arguments. CPU preparation performs `uv sync --frozen`, downloads real HotpotQA data and model weights, and saves the pinned preparation manifest. GPU evaluation uses offline cached weights and compares cosine-only retrieval with frozen pooled-vector judging. Installation/downloads happen inside the CPU allocation. No workload runs on the login node.
 
 `--gres`, `--memory`, `--cpus`, `--prepare-time`, `--evaluate-time`, `--qos`, and `--reservation` configure scheduler resources. `--min-vram-gb` defaults to 16; `--require-bf16` optionally checks BF16 support. Actual memory use and throughput still require allocated-node measurements. The wrapper checks at least `--min-free-gb` free space (default 30 GB); allow more for large datasets and caches.
 

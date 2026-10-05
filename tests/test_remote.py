@@ -88,6 +88,7 @@ def test_evaluate_worker_resume_only_when_config_exists(run,monkeypatch,resume):
     p.worker('evaluate',run)
     args,kwargs=calls[-1]
     assert ('--resume' in args)==resume
+    assert kwargs['env']['UV_CACHE_DIR']==str(p.ROOT/'cache'/'uv')
     assert kwargs['env']['EVIDENCE_STAGE']=='evaluate'
     assert kwargs['env']['EVIDENCE_RUN_DIR']==str(run)
     assert p.read(p.receipt(run,'evaluate'))['application_state']=='SUCCEEDED'
@@ -135,3 +136,77 @@ def test_command_terminates_isolated_child_group_on_interrupt(monkeypatch):
 def test_empty_path_rejected():
     import argparse
     with pytest.raises(argparse.ArgumentTypeError): p.required_path('  ')
+
+@pytest.fixture
+def mocked_launcher(tmp_path, monkeypatch):
+    """Exercise real CLI parsing/filesystem defaults without scheduler or downloads."""
+    root = tmp_path / 'project'
+    scripts = root / 'deploy' / 'scripts'
+    scripts.mkdir(parents=True)
+    for stage in ('prepare', 'evaluate'):
+        (scripts / f'{stage}.sbatch').write_text('# mock')
+    (root / 'uv.lock').write_text('# mock')
+    monkeypatch.setattr(p, 'ROOT', root)
+    monkeypatch.setattr(p, 'stamp', lambda: '20261005T120000Z')
+    monkeypatch.setattr(p.shutil, 'which', lambda name: '/mock/' + name)
+    monkeypatch.setattr(p.shutil, 'disk_usage', lambda path: SimpleNamespace(free=100 * 1024**3))
+    monkeypatch.setattr(p, 'dependency', lambda *args: None)
+    monkeypatch.setattr(p, 'monitor', lambda *args: None)
+    calls = []
+    monkeypatch.setattr(p, 'submit', lambda run, stage, cfg, dep=None: calls.append((run, stage, cfg, dep)) or '123')
+    return root, calls
+
+
+def test_submit_account_only_uses_project_defaults(mocked_launcher, monkeypatch):
+    root, calls = mocked_launcher
+    monkeypatch.setattr(p.sys, 'argv', ['pipeline.py', 'submit', '--account', 'mock'])
+    p.main()
+    run = root / 'runs' / 'run-20261005T120000Z'
+    cfg = p.read(run / 'manifest.json')
+    assert cfg['account'] == 'mock'
+    assert cfg['partition'] is None
+    assert cfg['cache_dir'] == str(root / 'cache' / 'huggingface')
+    assert (root / 'cache' / 'huggingface').is_dir()
+    assert [call[1] for call in calls] == ['prepare', 'evaluate']
+    assert all(call[0] == run for call in calls)
+
+
+def test_submit_default_run_collision_preserves_existing(mocked_launcher, monkeypatch):
+    root, calls = mocked_launcher
+    existing = root / 'runs' / 'run-20261005T120000Z'
+    existing.mkdir(parents=True)
+    (existing / 'preserved').write_text('untouched')
+    monkeypatch.setattr(p.sys, 'argv', ['pipeline.py', 'submit', '--account', 'mock'])
+    p.main()
+    assert calls[0][0] == existing.with_name(existing.name + '-001')
+    assert (existing / 'preserved').read_text() == 'untouched'
+
+
+def test_submit_resume_has_no_implicit_output_conflict(mocked_launcher, monkeypatch):
+    root, calls = mocked_launcher
+    run = root / 'old-run'
+    cfg = {**CFG, 'project': str(root), 'modules': [], 'cache_dir': str(root / 'old-cache')}
+    p.atomic(run / 'manifest.json', cfg)
+    monkeypatch.setattr(p.sys, 'argv', ['pipeline.py', 'submit', '--resume', str(run)])
+    p.main()
+    assert all(call[0] == run for call in calls)
+    assert calls[0][2]['cache_dir'] == str(root / 'old-cache')
+    assert not (root / 'runs').exists()
+    assert not (root / 'cache').exists()
+
+
+def test_submit_explicit_output_and_resume_rejected(mocked_launcher, monkeypatch, capsys):
+    root, calls = mocked_launcher
+    monkeypatch.setattr(p.sys, 'argv', ['pipeline.py', 'submit', '--output', str(root / 'new'), '--resume', str(root / 'old')])
+    with pytest.raises(SystemExit) as exc:
+        p.main()
+    assert exc.value.code == 2
+    assert '--output and --resume cannot be used together' in capsys.readouterr().err
+    assert calls == []
+
+
+def test_submit_without_partition_emits_no_partition_flag(run, monkeypatch):
+    calls = []
+    monkeypatch.setattr(p.subprocess, 'run', lambda args, **kwargs: calls.append(args) or SimpleNamespace(returncode=0, stdout='123\n', stderr=''))
+    p.submit(run, 'prepare', CFG)
+    assert not any(arg.startswith('--partition') for arg in calls[0])

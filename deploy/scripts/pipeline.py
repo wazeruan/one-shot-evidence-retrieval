@@ -118,7 +118,7 @@ def worker(stage,run):
     def fail(signum,frame): raise RuntimeError(f'Received signal {signum}')
     signal.signal(signal.SIGTERM,fail); signal.signal(signal.SIGINT,fail)
     try:
-        env=os.environ.copy(); env.update(PYTHONUNBUFFERED='1',HF_HOME=cfg['cache_dir'])
+        env=os.environ.copy(); env.update(PYTHONUNBUFFERED='1',HF_HOME=cfg['cache_dir'],UV_CACHE_DIR=str(ROOT/'cache'/'uv'))
         if cfg['modules']:
             # Module names validated by submit CLI; no user shell code is accepted.
             module_cmd='set -Eeuo pipefail; module load '+ ' '.join(cfg['modules'])+'; exec "$@"'
@@ -147,7 +147,7 @@ def worker(stage,run):
 def main():
     p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='action',required=True)
     s=sub.add_parser('submit'); s.add_argument('--output',type=required_path); s.add_argument('--resume',type=required_path)
-    for name,default in [('model','Qwen/Qwen3-4B'),('cache-dir',None),('account',None),('partition',None),('qos',None),('reservation',None),('gres','gpu:h100:1'),('memory','128G'),('prepare-time','02:00:00'),('evaluate-time','04:00:00')]: s.add_argument('--'+name,default=default)
+    for name,default in [('model','Qwen/Qwen3-4B'),('cache-dir',str(ROOT/'cache'/'huggingface')),('account',None),('partition',None),('qos',None),('reservation',None),('gres','gpu:h100:1'),('memory','128G'),('prepare-time','02:00:00'),('evaluate-time','04:00:00')]: s.add_argument('--'+name,default=default)
     for name,default in [('cpus',8),('top-k',5),('bundle-size',2),('max-bundles',30),('max-tokens',2048),('limit',20),('min-vram-gb',16),('min-free-gb',30)]: s.add_argument('--'+name,type=int,default=default)
     s.add_argument('--module',action='append',default=[]); s.add_argument('--require-bf16',action='store_true'); s.add_argument('--monitor-seconds',type=int,default=10)
     for name in ('status','results'):
@@ -166,7 +166,9 @@ def main():
             if dependency(run,'evaluate')!='complete': raise RuntimeError('Results not verified complete')
             print('\n'.join(str(x) for x in (run/'results').rglob('*') if x.is_file()))
         return
-    if bool(a.output)==bool(a.resume): p.error('Specify exactly one of --output or --resume')
+    if a.output and a.resume: p.error('--output and --resume cannot be used together')
+    if not a.output and not a.resume:
+        a.output = ROOT/'runs'/('run-'+stamp())
     if not 0<=a.monitor_seconds<=60: p.error('--monitor-seconds must be 0..60')
     for key in ('cpus','top_k','bundle_size','max_bundles','max_tokens','limit','min_vram_gb','min_free_gb'):
         if getattr(a,key)<=0: p.error(key+' must be positive')
