@@ -15,7 +15,7 @@ uv run one-shot-evidence-retrieval --documents examples/documents.jsonl --query 
 
 First use downloads model weights; allow several GB of storage. Use `--local-files-only` for an already cached model. CPU defaults to FP32; MPS/CUDA use FP16. Use the remote workflow for cluster execution. Model loading is excluded from timing.
 
-The comparison returns both cosine-only top-m and judged selection from the SAME top-k pool. `--baseline-only` skips judging. `--top-k 5 --bundle-size 2` evaluates all ten pairs with two judge forwards per pair. This is one-shot search with multiple bundle evaluations, not a single judge call. `--max-bundles` bounds cost. Coverage is set-level. The shortlist is never expanded. The baseline and judged method select the same number of documents, not necessarily equal text-token budgets.
+The comparison returns both cosine-only top-m and judged selection from the SAME top-k pool. `--baseline-only` skips judging. `--top-k 5 --bundle-size 2` evaluates all ten pairs with two logical judgments per pair, processed in batches. This is one-shot search with multiple bundle evaluations, not a single judge call. `--max-bundles` bounds cost. Coverage is set-level. The shortlist is never expanded. The baseline and judged method select the same number of documents, not necessarily equal text-token budgets.
 
 ## Exact experimental interface
 
@@ -46,3 +46,11 @@ Metrics include gold supporting-document recall, precision, complete coverage, s
 ## Progress graphs
 
 GPU evaluation automatically writes `results/progress.html` and `results/progress.json` after every completed query, including resumed queries. Download the standalone HTML and open it in a browser; reload after fetching updates. No server, plotting dependency or external assets are needed. Curves show running evidence recall/complete coverage for both methods, per-query cosine and judging latency, selected-bundle coverage/correctness predictions, and yes/no vocabulary mass. These are evaluation curves: the current project has no training loop or losses. They do not establish factual correctness or calibrated judgment probabilities.
+
+## Batched prefill-only judging
+
+The judge never calls `generate`, samples an output token, or executes a decoding loop: it reads final-position yes/no logits. Default judging now batches up to 8 independent prompts (`--judge-batch-size 8`) and reuses the exact common instruction/query prefix KV cache once per query. Equal-length prompts are grouped to avoid padding. Each suffix batch receives its own cache copy; cache state is not reused across queries or persisted. Prefix caching is a two-part prefill, not token generation. Final vocabulary logits are computed only at the last suffix position.
+
+Ten document pairs still imply 20 logical judgments, but fewer model forwards. Reports distinguish `judge_calls` (logical judgments), `judge_forward_calls` (including prefix prefill), and `judge_prefix_tokens`. Use `--judge-batch-size 1 --no-prefix-cache` to compare with sequential execution, and `--no-prefix-cache` alone for batching without KV reuse. GPU memory grows with batch size. Speedup is not guaranteed; benchmark on allocated hardware. The judge's compressed-vector semantics are unchanged.
+
+Start a fresh run after updating code; prior run configuration and checkpoint hashes prevent silently mixing implementations on resume. Preparation currently runs again for a fresh run, using existing cached downloads.

@@ -160,6 +160,8 @@ def evaluate(args):
         raise ValueError('Model must match prepared snapshot')
     documents = read_jsonl(data / 'documents.jsonl')
     queries = read_jsonl(data / 'queries.jsonl')[:args.limit]
+    if args.judge_batch_size < 1:
+        raise ValueError('judge batch size must be positive')
     candidate_bundles(min(args.top_k, len(documents)), args.bundle_size, args.max_bundles)
     combined_score(0, 0, 0, args.weights)
     out = Path(args.output).resolve()
@@ -167,7 +169,8 @@ def evaluate(args):
     config = {'manifest_hash': digest(data / 'manifest.json'), 'model_revision': manifest['model_revision'],
         'model': args.model, 'device': args.device, 'top_k': args.top_k, 'bundle_size': args.bundle_size,
         'max_tokens': args.max_tokens, 'limit': args.limit, 'weights': args.weights, 'contextual': args.contextual,
-        'max_bundles': args.max_bundles, 'code_hash': digest(Path(__file__)) + digest(Path(__file__).with_name('__init__.py'))}
+        'max_bundles': args.max_bundles, 'judge_batch_size': args.judge_batch_size,
+        'prefix_cache': not args.no_prefix_cache, 'code_hash': digest(Path(__file__)) + digest(Path(__file__).with_name('__init__.py'))}
     if args.resume:
         if json.loads((out / 'config.json').read_text()) != config:
             raise ValueError('Resume configuration mismatch')
@@ -182,7 +185,7 @@ def evaluate(args):
     model = AutoModelForCausalLM.from_pretrained(path, local_files_only=True, dtype=dtype).to(args.device)
     if sum(p.numel() for p in model.parameters()) >= 9_000_000_000:
         raise ValueError('Model must have fewer than 9B parameters')
-    runner = Search(model, tokenizer, args.device, args.max_tokens, args.contextual)
+    runner = Search(model, tokenizer, args.device, args.max_tokens, args.contextual, args.judge_batch_size, not args.no_prefix_cache)
     notify_started()
     runner.sync()
     t0 = time.perf_counter()
@@ -241,6 +244,8 @@ def main():
     ev.add_argument('--max-tokens', type=int, default=512)
     ev.add_argument('--limit', type=int, default=20)
     ev.add_argument('--weights', type=float, nargs=3, default=[1,1,1])
+    ev.add_argument('--judge-batch-size', type=int, default=8)
+    ev.add_argument('--no-prefix-cache', action='store_true')
     ev.add_argument('--contextual', action='store_true')
     ev.add_argument('--resume', action='store_true')
     args = parser.parse_args()

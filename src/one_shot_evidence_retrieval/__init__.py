@@ -36,7 +36,12 @@ def combined_score(relevance, coverage, correctness, weights):
 
 
 class Search:
-    def __init__(self, model, tokenizer, device, max_tokens=512, contextual=False):
+    def __init__(self, model, tokenizer, device, max_tokens=512, contextual=False, judge_batch_size=8, prefix_cache=True):
+        if judge_batch_size < 1:
+            raise ValueError('judge_batch_size must be positive')
+        self.judge_batch_size = judge_batch_size
+        self.prefix_cache = prefix_cache
+        self.last_judge_stats = {'requests': 0, 'forward_calls': 0, 'prefix_tokens': 0}
         self.model = model.eval()
         self.tokenizer = tokenizer
         self.device = device
@@ -74,7 +79,7 @@ class Search:
         return vector, clipped
 
     @torch.inference_mode()
-    def judge(self, query_vector, vectors, criterion):
+    def _judge_inputs(self, query_vector, vectors, criterion):
         # Experimental soft-token interface: unit vectors are rescaled to the
         # input embedding table's median norm. No trained adapter is claimed.
         question = {
@@ -104,13 +109,79 @@ class Search:
         context_limit = getattr(self.model.config, 'max_position_embeddings', None)
         if context_limit is not None and embedded.shape[1] > context_limit:
             raise ValueError('Judge prompt exceeds model context limit; reduce bundle size')
-        logits = self.model(inputs_embeds=embedded, attention_mask=torch.ones(embedded.shape[:2], device=self.device, dtype=torch.long), use_cache=False).logits[0, -1].float()
+        return embedded
+
+    def _read_judgment(self, logits, input_tokens):
+        logits = logits.float()
         if not torch.isfinite(logits).all():
             raise ValueError('Judge produced non-finite logits')
         label_ids = [label[0] for label in self.labels]
         conditional = logits[label_ids].softmax(dim=0)
         label_mass = logits.softmax(dim=0)[label_ids].sum()
-        return {'score': float(conditional[0]), 'yes_no_mass': float(label_mass), 'input_tokens': embedded.shape[1]}
+        return {'score': float(conditional[0]), 'yes_no_mass': float(label_mass), 'input_tokens': input_tokens}
+
+
+    @torch.inference_mode()
+    def judge(self, query_vector, vectors, criterion):
+        embedded = self._judge_inputs(query_vector, vectors, criterion)
+        logits = self.model(inputs_embeds=embedded,
+            attention_mask=torch.ones(embedded.shape[:2], device=self.device, dtype=torch.long),
+            use_cache=False).logits[0, -1]
+        return self._read_judgment(logits, embedded.shape[1])
+
+    @torch.inference_mode()
+    def judge_many(self, query_vector, requests):
+        """Batch independent prompts; reuse ONLY their exact common causal prefix.
+
+        Grouping by length avoids padding and lets us request final-position
+        logits only. The cache is scoped to this query and cloned before each
+        batch, so suffixes cannot contaminate another judgment.
+        """
+        import copy
+        prompts = [self._judge_inputs(query_vector, vectors, criterion)
+                   for vectors, criterion in requests]
+        stats = {'requests': len(prompts), 'forward_calls': 0, 'prefix_tokens': 0}
+        self.last_judge_stats = stats
+        if not prompts:
+            return []
+        prefix_length = 0
+        cache = None
+        if self.prefix_cache and len(prompts) > 1:
+            minimum = min(p.shape[1] for p in prompts) - 1
+            shared = torch.stack([p[0, :minimum] for p in prompts])
+            equal = (shared == shared[:1]).all(dim=0).all(dim=-1)
+            prefix_length = int(equal.to(torch.int64).cumprod(0).sum().item())
+            if prefix_length:
+                prefix = prompts[0][:, :prefix_length]
+                cache = self.model.model(inputs_embeds=prefix,
+                    attention_mask=torch.ones(prefix.shape[:2], device=self.device, dtype=torch.long),
+                    use_cache=True).past_key_values
+                if cache is None or not hasattr(cache, 'batch_repeat_interleave'):
+                    raise ValueError('Model must provide a repeatable Transformers KV cache; disable prefix caching for unsupported models')
+                stats['forward_calls'] += 1
+                stats['prefix_tokens'] = prefix_length
+        groups = {}
+        for i, prompt in enumerate(prompts):
+            groups.setdefault(prompt.shape[1], []).append(i)
+        results = [None] * len(prompts)
+        for length, indices in groups.items():
+            for offset in range(0, len(indices), self.judge_batch_size):
+                selected = indices[offset:offset+self.judge_batch_size]
+                embedded = torch.cat([prompts[i][:, prefix_length:] for i in selected], dim=0)
+                kwargs = {}
+                if cache is not None:
+                    batch_cache = copy.deepcopy(cache)
+                    batch_cache.batch_repeat_interleave(len(selected))
+                    kwargs['past_key_values'] = batch_cache
+                positions = torch.arange(prefix_length, length, device=self.device)[None, :].expand(len(selected), -1)
+                logits = self.model(inputs_embeds=embedded,
+                    attention_mask=torch.ones((len(selected), length), device=self.device, dtype=torch.long),
+                    position_ids=positions, use_cache=cache is not None,
+                    logits_to_keep=1, **kwargs).logits[:, -1]
+                stats['forward_calls'] += 1
+                for i, row in zip(selected, logits):
+                    results[i] = self._read_judgment(row, length)
+        return results
 
     def run(self, query, documents, top_k, size, weights, max_bundles, baseline_only=False, index=None):
         self.sync()
@@ -137,12 +208,17 @@ class Search:
         retrieved = time.perf_counter()
         baseline = [documents[i]['id'] for i in indices[:size]]
         evaluations = []
+        self.last_judge_stats = {'requests': 0, 'forward_calls': 0, 'prefix_tokens': 0}
         if not baseline_only:
+            requests = []
             for bundle in bundles:
+                evidence = [matrix[indices[j]] for j in bundle]
+                requests.extend([(evidence, 'coverage'), (evidence, 'correctness')])
+            judgments = self.judge_many(q, requests)
+            for bundle_index, bundle in enumerate(bundles):
                 chosen = [indices[j] for j in bundle]
                 evidence = [matrix[i] for i in chosen]
-                coverage = self.judge(q, evidence, 'coverage')
-                correctness = self.judge(q, evidence, 'correctness')
+                coverage, correctness = judgments[2*bundle_index:2*bundle_index+2]
                 relevance = float(scores[chosen].mean())
                 value = combined_score((relevance + 1) / 2, coverage['score'], correctness['score'], weights)
                 evaluations.append({'ids': [documents[i]['id'] for i in chosen], 'cosine': relevance,
@@ -156,6 +232,9 @@ class Search:
                 'query_truncated': qtruncated, 'timing_ms': {'index': 1000*(indexed-start),
                 'baseline_online': 1000*(retrieved-indexed), 'judge_extra': 1000*(end-retrieved)},
                 'judge_calls': 2*len(evaluations),
+                'judge_forward_calls': self.last_judge_stats['forward_calls'],
+                'judge_prefix_tokens': self.last_judge_stats['prefix_tokens'],
+                'judge_batch_size': self.judge_batch_size,
                 'warning': 'Untrained pooled-vector interface. Scores are NOT calibrated and correctness has no external verification.'}
 
 
@@ -170,13 +249,15 @@ def main():
     parser.add_argument('--max-bundles', type=int, default=30)
     parser.add_argument('--max-tokens', type=int, default=512)
     parser.add_argument('--weights', type=float, nargs=3, default=[1, 1, 1])
+    parser.add_argument('--judge-batch-size', type=int, default=8)
+    parser.add_argument('--no-prefix-cache', action='store_true')
     parser.add_argument('--contextual', action='store_true', help='Use final contextual hidden states rather than the input embedding layer')
     parser.add_argument('--baseline-only', action='store_true')
     parser.add_argument('--local-files-only', action='store_true')
     parser.add_argument('--output', required=True)
     args = parser.parse_args()
-    if args.top_k < 1 or args.max_tokens < 1 or args.max_bundles < 1:
-        parser.error('top-k, max-tokens and max-bundles must be positive')
+    if args.top_k < 1 or args.max_tokens < 1 or args.max_bundles < 1 or args.judge_batch_size < 1:
+        parser.error('top-k, max-tokens, max-bundles and judge-batch-size must be positive')
     combined_score(0, 0, 0, args.weights)
     documents = read_jsonl(args.documents)
     count = min(args.top_k, len(documents))
@@ -190,7 +271,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, local_files_only=args.local_files_only).to(args.device)
     if sum(p.numel() for p in model.parameters()) >= 9_000_000_000:
         raise ValueError('This experiment requires a model below 9B parameters')
-    runner = Search(model, tokenizer, args.device, args.max_tokens, args.contextual)
+    runner = Search(model, tokenizer, args.device, args.max_tokens, args.contextual, args.judge_batch_size, not args.no_prefix_cache)
     result = runner.run(args.query, documents, args.top_k, args.bundle_size, args.weights, args.max_bundles, args.baseline_only)
     result['config'] = vars(args)
     path = Path(args.output)

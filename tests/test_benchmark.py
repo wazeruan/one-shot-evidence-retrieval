@@ -91,7 +91,7 @@ def test_evaluate_resume_and_no_gold_leakage(tmp_path, monkeypatch):
                 'timing_ms':{'baseline_online':1.,'judge_extra':2.}}
     monkeypatch.setattr(b,'Search',FakeSearch)
     args=SimpleNamespace(data=str(data),output=str(tmp_path/'results'),model='fake',device='cpu',
-        top_k=3,bundle_size=1,max_tokens=32,limit=2,weights=[1,1,1],contextual=False,max_bundles=5,resume=False)
+        top_k=3,bundle_size=1,max_tokens=32,limit=2,weights=[1,1,1],contextual=False,max_bundles=5,resume=False,judge_batch_size=8,no_prefix_cache=False)
     b.evaluate(args)
     assert calls==[q['text'] for q in queries]
     out=tmp_path/'results'

@@ -70,10 +70,12 @@ def test_cpu_submission_has_no_gpu_request(run,monkeypatch):
     assert not any(a.startswith('--dependency') for a in calls[0])
 
 @pytest.mark.parametrize('resume',[False,True])
-def test_evaluate_worker_resume_only_when_config_exists(run,monkeypatch,resume):
+@pytest.mark.parametrize('judge_options',[{}, {'judge_batch_size':3,'no_prefix_cache':True}])
+def test_evaluate_worker_resume_only_when_config_exists(run,monkeypatch,resume,judge_options):
     import os
     cfg={**CFG,'project':str(p.ROOT),'cache_dir':str(run/'cache'),'modules':[], 'min_vram_gb':16,
         'require_bf16':False,'model':'fake','top_k':5,'bundle_size':2,'max_bundles':30,'max_tokens':32,'limit':20}
+    cfg.update(judge_options)
     p.atomic(run/'manifest.json',cfg)
     p.update(run,'evaluate',job_id='123',application_state='SUBMITTED')
     if resume: p.atomic(run/'results/config.json',{})
@@ -88,6 +90,8 @@ def test_evaluate_worker_resume_only_when_config_exists(run,monkeypatch,resume):
     p.worker('evaluate',run)
     args,kwargs=calls[-1]
     assert ('--resume' in args)==resume
+    assert args[args.index('--judge-batch-size')+1] == str(judge_options.get('judge_batch_size',8))
+    assert ('--no-prefix-cache' in args) == judge_options.get('no_prefix_cache',False)
     assert kwargs['env']['UV_CACHE_DIR']==str(p.ROOT/'cache'/'uv')
     assert kwargs['env']['EVIDENCE_STAGE']=='evaluate'
     assert kwargs['env']['EVIDENCE_RUN_DIR']==str(run)
@@ -210,3 +214,13 @@ def test_submit_without_partition_emits_no_partition_flag(run, monkeypatch):
     monkeypatch.setattr(p.subprocess, 'run', lambda args, **kwargs: calls.append(args) or SimpleNamespace(returncode=0, stdout='123\n', stderr=''))
     p.submit(run, 'prepare', CFG)
     assert not any(arg.startswith('--partition') for arg in calls[0])
+
+def test_submit_judge_flags_persist_to_manifest(mocked_launcher, monkeypatch):
+    root, calls = mocked_launcher
+    monkeypatch.setattr(p.sys, 'argv', ['pipeline.py','submit','--account','mock',
+        '--judge-batch-size','3','--no-prefix-cache'])
+    p.main()
+    cfg = p.read(root/'runs'/'run-20261005T120000Z'/'manifest.json')
+    assert cfg['judge_batch_size'] == 3
+    assert cfg['no_prefix_cache'] is True
+    assert all(call[2]['judge_batch_size'] == 3 and call[2]['no_prefix_cache'] for call in calls)

@@ -138,6 +138,8 @@ def worker(stage,run):
             args += ['--data',str(run/'data'),'--output',str(run/'results'),'--model',cfg['model'],'--device','cuda']
             if (run/'results'/'config.json').is_file(): args.append('--resume')
             for key in ('top_k','bundle_size','max_bundles','max_tokens','limit'): args += ['--'+key.replace('_','-'),str(cfg[key])]
+            args += ['--judge-batch-size', str(cfg.get('judge_batch_size', 8))]
+            if cfg.get('no_prefix_cache', False): args.append('--no-prefix-cache')
         update(run,stage,application_command=args); execute(args)
         if not artifacts(run,stage): raise RuntimeError('Expected output artifacts missing')
         update(run,stage,application_state='SUCCEEDED',exit_code=0)
@@ -148,7 +150,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='action',required=True)
     s=sub.add_parser('submit'); s.add_argument('--output',type=required_path); s.add_argument('--resume',type=required_path)
     for name,default in [('model','Qwen/Qwen3-4B'),('cache-dir',str(ROOT/'cache'/'huggingface')),('account',None),('partition',None),('qos',None),('reservation',None),('gres','gpu:h100:1'),('memory','128G'),('prepare-time','02:00:00'),('evaluate-time','04:00:00')]: s.add_argument('--'+name,default=default)
-    for name,default in [('cpus',8),('top-k',5),('bundle-size',2),('max-bundles',30),('max-tokens',2048),('limit',20),('min-vram-gb',16),('min-free-gb',30)]: s.add_argument('--'+name,type=int,default=default)
+    for name,default in [('judge-batch-size',8),('cpus',8),('top-k',5),('bundle-size',2),('max-bundles',30),('max-tokens',2048),('limit',20),('min-vram-gb',16),('min-free-gb',30)]: s.add_argument('--'+name,type=int,default=default)
+    s.add_argument('--no-prefix-cache', action='store_true')
     s.add_argument('--module',action='append',default=[]); s.add_argument('--require-bf16',action='store_true'); s.add_argument('--monitor-seconds',type=int,default=10)
     for name in ('status','results'):
         x=sub.add_parser(name); x.add_argument('run',type=required_path)
@@ -170,7 +173,7 @@ def main():
     if not a.output and not a.resume:
         a.output = ROOT/'runs'/('run-'+stamp())
     if not 0<=a.monitor_seconds<=60: p.error('--monitor-seconds must be 0..60')
-    for key in ('cpus','top_k','bundle_size','max_bundles','max_tokens','limit','min_vram_gb','min_free_gb'):
+    for key in ('judge_batch_size','cpus','top_k','bundle_size','max_bundles','max_tokens','limit','min_vram_gb','min_free_gb'):
         if getattr(a,key)<=0: p.error(key+' must be positive')
     if a.bundle_size>a.top_k: p.error('bundle-size cannot exceed top-k')
     if math.comb(a.top_k,a.bundle_size)>a.max_bundles: p.error('max-bundles must cover all fixed-size bundles')
