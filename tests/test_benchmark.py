@@ -19,7 +19,11 @@ def prepared(tmp_path):
     docs, queries = b.convert_rows(rows())
     for name, records in [('documents',docs), ('queries',queries)]:
         (data/f'{name}.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
-    manifest = {'model':'fake', 'model_revision':'pin', 'model_path':'unused',
+    embedding_path=tmp_path/'embedding-snapshot'
+    embedding_path.mkdir()
+    (embedding_path/'config.json').write_text('{"hidden_size":2}')
+    manifest = {'embedding_model':'embedding-fake','embedding_revision':'embedding-pin',
+        'embedding_path':str(embedding_path),'embedding_config_hash':b.digest(embedding_path/'config.json'), 'model':'fake', 'model_revision':'pin', 'model_path':'unused',
         'hashes':{name:b.digest(data/name) for name in ('documents.jsonl','queries.jsonl')}}
     b.atomic_json(data/'manifest.json',manifest)
     b.atomic_json(data/'PREPARED.json',{'manifest_sha256':b.digest(data/'manifest.json')})
@@ -69,11 +73,19 @@ def test_evaluate_resume_and_no_gold_leakage(tmp_path, monkeypatch):
     import transformers
     data, docs, queries = prepared(tmp_path)
     calls=[]
+    loads=[]
     class FakeModel:
+        config=SimpleNamespace(hidden_size=2)
+        def eval(self): return self
+        def get_input_embeddings(self): return SimpleNamespace(weight=torch.zeros(64,2))
         def to(self, device): return self
         def parameters(self): return iter([torch.zeros(1)])
-    monkeypatch.setattr(transformers.AutoTokenizer, 'from_pretrained', lambda *a, **kw: object())
-    monkeypatch.setattr(transformers.AutoModelForCausalLM, 'from_pretrained', lambda *a, **kw: FakeModel())
+    def load(kind,path,**kwargs):
+        loads.append((kind,path,kwargs))
+        return object() if kind=='tokenizer' else FakeModel()
+    monkeypatch.setattr(transformers.AutoTokenizer, 'from_pretrained', lambda path, **kw: load('tokenizer',path,**kw))
+    monkeypatch.setattr(transformers.AutoModelForCausalLM, 'from_pretrained', lambda path, **kw: load('judge',path,**kw))
+    monkeypatch.setattr(transformers.AutoModel, 'from_pretrained', lambda path, **kw: load('embedding',path,**kw))
     class FakeSearch:
         def __init__(self,*a): pass
         def sync(self): pass
@@ -90,11 +102,20 @@ def test_evaluate_resume_and_no_gold_leakage(tmp_path, monkeypatch):
                     'correctness':{'score':.9,'yes_no_mass':.8}}],
                 'timing_ms':{'baseline_online':1.,'judge_extra':2.}}
     monkeypatch.setattr(b,'Search',FakeSearch)
-    args=SimpleNamespace(data=str(data),output=str(tmp_path/'results'),model='fake',device='cpu',
+    args=SimpleNamespace(embedding_model='embedding-fake',data=str(data),output=str(tmp_path/'results'),model='fake',device='cpu',
         top_k=3,bundle_size=1,max_tokens=32,limit=2,weights=[1,1,1],contextual=False,max_bundles=5,resume=False,judge_batch_size=8,no_prefix_cache=False)
     b.evaluate(args)
     assert calls==[q['text'] for q in queries]
+    assert [kind for kind,_,_ in loads]==['tokenizer','judge','tokenizer','embedding']
+    assert all(kwargs['local_files_only'] for _,_,kwargs in loads)
+    manifest=json.loads((data/'manifest.json').read_text())
+    assert loads[-1][1]==manifest['embedding_path']
+    assert loads[1][1]==manifest['model_path']
     out=tmp_path/'results'
+    saved_config=json.loads((out/'config.json').read_text())
+    assert saved_config['embedding_model']=='embedding-fake'
+    assert saved_config['embedding_revision']=='embedding-pin'
+    assert saved_config['embedding_config_hash']==manifest['embedding_config_hash']
     receipt=json.loads((out/'SUCCEEDED.json').read_text())
     assert receipt['summary_sha256']==b.digest(out/'summary.json')
     assert json.loads((out/'progress.json').read_text())['query_ids']==['q1','q2']
@@ -122,3 +143,69 @@ def test_started_marker_preserves_submission_metadata(tmp_path,monkeypatch):
     marker=json.loads((run/'receipts/evaluate-STARTED.json').read_text())
     assert marker['job_id']=='123'
     assert marker['run_dir']==str(run.resolve())
+
+def test_prepare_pins_both_model_snapshots(tmp_path,monkeypatch):
+    import datasets
+    import huggingface_hub
+    model_calls=[]
+    snapshots=[]
+    class Api:
+        def dataset_info(self,name,revision):return SimpleNamespace(sha='dataset-sha')
+        def model_info(self,name,revision):
+            model_calls.append((name,revision))
+            return SimpleNamespace(sha=name+'-sha')
+    def snapshot(name,**kwargs):
+        snapshots.append((name,kwargs))
+        path=tmp_path/name
+        path.mkdir(parents=True)
+        if kwargs.get('repo_type')=='dataset':
+            (path/'distractor').mkdir()
+            (path/'distractor/validation-00000.parquet').write_text('fake')
+        else:(path/'config.json').write_text('{}')
+        return str(path)
+    class Dataset(list):
+        def shuffle(self,seed):return self
+        def select(self,indices):return [self[i] for i in indices]
+    monkeypatch.setattr(huggingface_hub,'HfApi',Api)
+    monkeypatch.setattr(huggingface_hub,'snapshot_download',snapshot)
+    monkeypatch.setattr(datasets,'load_dataset',lambda *a,**kw:Dataset(rows()))
+    args=SimpleNamespace(output=str(tmp_path/'data'),cache_dir=str(tmp_path/'cache'),
+        model='judge',model_revision='judge-requested',embedding_model='embedding',
+        embedding_revision='embedding-requested',dataset_revision='dataset-requested',seed=17,limit=2)
+    b.prepare(args)
+    manifest=b.validate_prepared(tmp_path/'data')
+    assert model_calls==[('judge','judge-requested'),('embedding','embedding-requested')]
+    assert [(name,kw['revision']) for name,kw in snapshots]==[
+        ('hotpotqa/hotpot_qa','dataset-sha'),('judge','judge-sha'),('embedding','embedding-sha')]
+    assert manifest['model_revision']=='judge-sha'
+    assert manifest['embedding_revision']=='embedding-sha'
+    assert manifest['embedding_config_hash']==b.digest(tmp_path/'embedding/config.json')
+
+@pytest.mark.parametrize('change',['wrong-model','modified-config','legacy-manifest'])
+def test_evaluate_rejects_incompatible_embedding_before_loading(tmp_path,monkeypatch,change):
+    import transformers
+    data,_,_=prepared(tmp_path)
+    args=SimpleNamespace(data=str(data),model='fake',embedding_model='embedding-fake')
+    manifest=json.loads((data/'manifest.json').read_text())
+    if change=='wrong-model':args.embedding_model='other'
+    if change=='modified-config':(tmp_path/'embedding-snapshot/config.json').write_text('changed')
+    if change=='legacy-manifest':
+        manifest.pop('embedding_model')
+        b.atomic_json(data/'manifest.json',manifest)
+        b.atomic_json(data/'PREPARED.json',{'manifest_sha256':b.digest(data/'manifest.json')})
+    monkeypatch.setattr(transformers.AutoModel,'from_pretrained',lambda *a,**kw:pytest.fail('Must reject before loading'))
+    with pytest.raises(ValueError,match='Embedding|embedding'):
+        b.evaluate(args)
+
+@pytest.mark.parametrize('command',['prepare','evaluate'])
+def test_embedding_cli_defaults(monkeypatch,tmp_path,command):
+    import sys
+    captured=[]
+    monkeypatch.setattr(b,command,lambda args:captured.append(args))
+    args=['benchmark',command,'--output',str(tmp_path/'output')]
+    args+=['--cache-dir',str(tmp_path/'cache')] if command=='prepare' else ['--data',str(tmp_path/'data')]
+    monkeypatch.setattr(sys,'argv',args)
+    b.main()
+    assert captured[0].embedding_model=='Qwen/Qwen3-Embedding-4B'
+    assert captured[0].model=='Qwen/Qwen3-4B'
+    if command=='prepare':assert captured[0].embedding_revision=='main'

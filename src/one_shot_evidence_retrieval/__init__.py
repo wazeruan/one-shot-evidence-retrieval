@@ -35,8 +35,40 @@ def combined_score(relevance, coverage, correctness, weights):
     return sum(w * s for w, s in zip(weights, (relevance, coverage, correctness))) / sum(weights)
 
 
+class EmbeddingRetriever:
+    """Frozen Qwen3-Embedding contextual last-token retriever."""
+    instruction = 'Given a web search query, retrieve relevant passages that answer the query'
+
+    def __init__(self, model, tokenizer, device, max_tokens=512):
+        self.model = model.eval()
+        self.tokenizer = tokenizer
+        self.device = device
+        self.max_tokens = max_tokens
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+
+    @torch.inference_mode()
+    def encode(self, text, is_query=False):
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError('Embedding input must be nonempty text')
+        if is_query:
+            text = f'Instruct: {self.instruction}\nQuery:{text}'
+        full = self.tokenizer(text, add_special_tokens=True, truncation=False)
+        clipped = len(full['input_ids']) > self.max_tokens
+        inputs = self.tokenizer(text, add_special_tokens=True, truncation=True,
+                                max_length=self.max_tokens, return_tensors='pt').to(self.device)
+        hidden = self.model(**inputs, use_cache=False).last_hidden_state
+        mask = inputs['attention_mask']
+        positions = torch.arange(mask.shape[1], device=mask.device).expand_as(mask)
+        last = positions.masked_fill(mask == 0, -1).max(dim=1).values
+        pooled = hidden[torch.arange(hidden.shape[0], device=hidden.device), last].float()
+        if not torch.isfinite(pooled).all() or (pooled.norm(dim=-1) == 0).any():
+            raise ValueError('Embedding retriever produced non-finite or zero embeddings')
+        return F.normalize(pooled, dim=-1)[0], clipped
+
+
 class Search:
-    def __init__(self, model, tokenizer, device, max_tokens=512, contextual=False, judge_batch_size=8, prefix_cache=True):
+    def __init__(self, model, tokenizer, device, max_tokens=512, contextual=False, judge_batch_size=8, prefix_cache=True, retriever=None):
         if judge_batch_size < 1:
             raise ValueError('judge_batch_size must be positive')
         self.judge_batch_size = judge_batch_size
@@ -47,6 +79,7 @@ class Search:
         self.device = device
         self.max_tokens = max_tokens
         self.contextual = contextual
+        self.retriever = retriever
         for p in model.parameters():
             p.requires_grad_(False)
         self.layer = model.get_input_embeddings()
@@ -63,6 +96,8 @@ class Search:
 
     @torch.inference_mode()
     def encode(self, text):
+        if self.retriever is not None:
+            return self.retriever.encode(text)
         ids = self.tokenizer.encode(text, add_special_tokens=False)
         if not ids:
             raise ValueError('Empty token sequence')
@@ -78,10 +113,16 @@ class Search:
         vector = F.normalize(pooled, dim=-1)[0]
         return vector, clipped
 
+    def encode_query(self, text):
+        return self.retriever.encode(text, is_query=True) if self.retriever is not None else self.encode(text)
+
     @torch.inference_mode()
     def _judge_inputs(self, query_vector, vectors, criterion):
         # Experimental soft-token interface: unit vectors are rescaled to the
         # input embedding table's median norm. No trained adapter is claimed.
+        expected = self.layer.weight.shape[1]
+        if any(vector.ndim != 1 or vector.shape[0] != expected for vector in [query_vector, *vectors]):
+            raise ValueError(f'Retriever vectors must match judge input width {expected}; no trained adapter is available')
         question = {
             'coverage': 'Does the supplied evidence jointly cover EVERY information requirement of the query?',
             'correctness': 'Are the claims in the supplied evidence factually correct and applicable to the query?',
@@ -195,7 +236,7 @@ class Search:
                 raise ValueError('Index must match document count')
         self.sync()
         indexed = time.perf_counter()
-        q, qtruncated = self.encode(query)
+        q, qtruncated = self.encode_query(query)
         if not torch.isfinite(matrix).all():
             raise ValueError('Index contains non-finite embeddings')
         scores = matrix @ q
@@ -243,6 +284,7 @@ def main():
     parser.add_argument('--documents', required=True)
     parser.add_argument('--query', required=True)
     parser.add_argument('--model', default='Qwen/Qwen3-4B')
+    parser.add_argument('--embedding-model', default='Qwen/Qwen3-Embedding-4B')
     parser.add_argument('--device', choices=['cpu', 'mps', 'cuda'], default='cpu')
     parser.add_argument('--top-k', type=int, default=5)
     parser.add_argument('--bundle-size', type=int, default=2)
@@ -265,13 +307,18 @@ def main():
         parser.error('bundle size must be between 1 and shortlist size')
     if not args.baseline_only:
         candidate_bundles(count, args.bundle_size, args.max_bundles)
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=args.local_files_only)
     dtype = torch.float32 if args.device == 'cpu' else torch.float16
     model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, local_files_only=args.local_files_only).to(args.device)
     if sum(p.numel() for p in model.parameters()) >= 9_000_000_000:
         raise ValueError('This experiment requires a model below 9B parameters')
-    runner = Search(model, tokenizer, args.device, args.max_tokens, args.contextual, args.judge_batch_size, not args.no_prefix_cache)
+    embedding_tokenizer = AutoTokenizer.from_pretrained(args.embedding_model, local_files_only=args.local_files_only)
+    embedding_model = AutoModel.from_pretrained(args.embedding_model, dtype=dtype, local_files_only=args.local_files_only).to(args.device)
+    if sum(p.numel() for p in embedding_model.parameters()) >= 9_000_000_000:
+        raise ValueError('Embedding model must have fewer than 9B parameters')
+    retriever = EmbeddingRetriever(embedding_model, embedding_tokenizer, args.device, args.max_tokens)
+    runner = Search(model, tokenizer, args.device, args.max_tokens, False, args.judge_batch_size, not args.no_prefix_cache, retriever)
     result = runner.run(args.query, documents, args.top_k, args.bundle_size, args.weights, args.max_bundles, args.baseline_only)
     result['config'] = vars(args)
     path = Path(args.output)

@@ -133,9 +133,9 @@ def worker(stage,run):
         atomic(run/'receipts'/f'{stage}-ALLOCATED_READY.json',marker); update(run,stage,application_state='ALLOCATED_READY',allocation=marker)
         env.update(EVIDENCE_RUN_DIR=str(run),EVIDENCE_STAGE=stage,EVIDENCE_ALLOCATION_JSON=json.dumps(marker))
         args=['uv','run','--no-sync','python','-m','one_shot_evidence_retrieval.benchmark',stage]
-        if stage=='prepare': args += ['--dataset','hotpotqa','--output',str(run/'data'),'--cache-dir',cfg['cache_dir'],'--model',cfg['model'],'--limit',str(cfg['limit'])]
+        if stage=='prepare': args += ['--dataset','hotpotqa','--output',str(run/'data'),'--cache-dir',cfg['cache_dir'],'--model',cfg['model'],'--embedding-model',cfg.get('embedding_model','Qwen/Qwen3-Embedding-4B'),'--limit',str(cfg['limit']),'--embedding-revision',cfg.get('embedding_revision','main')]
         else:
-            args += ['--data',str(run/'data'),'--output',str(run/'results'),'--model',cfg['model'],'--device','cuda']
+            args += ['--data',str(run/'data'),'--output',str(run/'results'),'--model',cfg['model'],'--embedding-model',cfg.get('embedding_model','Qwen/Qwen3-Embedding-4B'),'--device','cuda']
             if (run/'results'/'config.json').is_file(): args.append('--resume')
             for key in ('top_k','bundle_size','max_bundles','max_tokens','limit'): args += ['--'+key.replace('_','-'),str(cfg[key])]
             args += ['--judge-batch-size', str(cfg.get('judge_batch_size', 8))]
@@ -149,8 +149,8 @@ def worker(stage,run):
 def main():
     p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='action',required=True)
     s=sub.add_parser('submit'); s.add_argument('--output',type=required_path); s.add_argument('--resume',type=required_path)
-    for name,default in [('model','Qwen/Qwen3-4B'),('cache-dir',str(ROOT/'cache'/'huggingface')),('account',None),('partition',None),('qos',None),('reservation',None),('gres','gpu:h100:1'),('memory','128G'),('prepare-time','02:00:00'),('evaluate-time','04:00:00')]: s.add_argument('--'+name,default=default)
-    for name,default in [('judge-batch-size',8),('cpus',8),('top-k',5),('bundle-size',2),('max-bundles',30),('max-tokens',2048),('limit',20),('min-vram-gb',16),('min-free-gb',30)]: s.add_argument('--'+name,type=int,default=default)
+    for name,default in [('model','Qwen/Qwen3-4B'),('embedding-model','Qwen/Qwen3-Embedding-4B'),('embedding-revision','main'),('cache-dir',str(ROOT/'cache'/'huggingface')),('account',None),('partition',None),('qos',None),('reservation',None),('gres','gpu:h100:1'),('memory','128G'),('prepare-time','02:00:00'),('evaluate-time','04:00:00')]: s.add_argument('--'+name,default=default)
+    for name,default in [('judge-batch-size',8),('cpus',8),('top-k',5),('bundle-size',2),('max-bundles',30),('max-tokens',2048),('limit',20),('min-vram-gb',24),('min-free-gb',30)]: s.add_argument('--'+name,type=int,default=default)
     s.add_argument('--no-prefix-cache', action='store_true')
     s.add_argument('--module',action='append',default=[]); s.add_argument('--require-bf16',action='store_true'); s.add_argument('--monitor-seconds',type=int,default=10)
     for name in ('status','results'):

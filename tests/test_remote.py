@@ -92,6 +92,7 @@ def test_evaluate_worker_resume_only_when_config_exists(run,monkeypatch,resume,j
     assert ('--resume' in args)==resume
     assert args[args.index('--judge-batch-size')+1] == str(judge_options.get('judge_batch_size',8))
     assert ('--no-prefix-cache' in args) == judge_options.get('no_prefix_cache',False)
+    assert args[args.index('--embedding-model')+1] == cfg.get('embedding_model','Qwen/Qwen3-Embedding-4B')
     assert kwargs['env']['UV_CACHE_DIR']==str(p.ROOT/'cache'/'uv')
     assert kwargs['env']['EVIDENCE_STAGE']=='evaluate'
     assert kwargs['env']['EVIDENCE_RUN_DIR']==str(run)
@@ -169,6 +170,9 @@ def test_submit_account_only_uses_project_defaults(mocked_launcher, monkeypatch)
     cfg = p.read(run / 'manifest.json')
     assert cfg['account'] == 'mock'
     assert cfg['partition'] is None
+    assert cfg['embedding_model']=='Qwen/Qwen3-Embedding-4B'
+    assert cfg['embedding_revision']=='main'
+    assert cfg['min_vram_gb']==24
     assert cfg['cache_dir'] == str(root / 'cache' / 'huggingface')
     assert (root / 'cache' / 'huggingface').is_dir()
     assert [call[1] for call in calls] == ['prepare', 'evaluate']
@@ -224,3 +228,27 @@ def test_submit_judge_flags_persist_to_manifest(mocked_launcher, monkeypatch):
     assert cfg['judge_batch_size'] == 3
     assert cfg['no_prefix_cache'] is True
     assert all(call[2]['judge_batch_size'] == 3 and call[2]['no_prefix_cache'] for call in calls)
+
+def test_embedding_options_persist_to_manifest(mocked_launcher,monkeypatch):
+    root,calls=mocked_launcher
+    monkeypatch.setattr(p.sys,'argv',['pipeline.py','submit','--account','mock',
+        '--embedding-model','custom/embedding','--embedding-revision','fixed-ref'])
+    p.main()
+    cfg=p.read(root/'runs/run-20261005T120000Z/manifest.json')
+    assert cfg['embedding_model']=='custom/embedding'
+    assert cfg['embedding_revision']=='fixed-ref'
+    assert all(call[2]['embedding_model']=='custom/embedding' for call in calls)
+
+def test_prepare_worker_passes_embedding_snapshot_config(run,monkeypatch):
+    cfg={**CFG,'project':str(p.ROOT),'cache_dir':str(run/'cache'),'modules':[],
+        'model':'judge','limit':20,'embedding_model':'custom/embedding','embedding_revision':'fixed-ref'}
+    p.atomic(run/'manifest.json',cfg)
+    p.update(run,'prepare',job_id='123',application_state='SUBMITTED')
+    monkeypatch.setenv('SLURM_JOB_ID','123')
+    monkeypatch.setattr(p,'artifacts',lambda *a:True)
+    calls=[]
+    monkeypatch.setattr(p,'command',lambda args,**kw:calls.append(args) or SimpleNamespace(stdout='JobState=RUNNING',returncode=0))
+    p.worker('prepare',run)
+    args=calls[-1]
+    assert args[args.index('--embedding-model')+1]=='custom/embedding'
+    assert args[args.index('--embedding-revision')+1]=='fixed-ref'

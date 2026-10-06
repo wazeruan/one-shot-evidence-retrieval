@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 import torch
-from . import Search, read_jsonl, candidate_bundles, combined_score
+from . import EmbeddingRetriever, Search, read_jsonl, candidate_bundles, combined_score
 
 
 def atomic_json(path, value):
@@ -87,6 +87,7 @@ def prepare(args):
     api = HfApi()
     revision = api.dataset_info('hotpotqa/hotpot_qa', revision=args.dataset_revision).sha
     model_revision = api.model_info(args.model, revision=args.model_revision).sha
+    embedding_revision = api.model_info(args.embedding_model, revision=args.embedding_revision).sha
     ds_snapshot = snapshot_download('hotpotqa/hotpot_qa', repo_type='dataset', revision=revision,
         allow_patterns=['distractor/validation-*.parquet'], cache_dir=str(cache / 'hub'))
     parquet = sorted(str(p) for p in Path(ds_snapshot).glob('distractor/validation-*.parquet'))
@@ -102,7 +103,10 @@ def prepare(args):
         temporary.replace(path)
     model_path = snapshot_download(args.model, revision=model_revision, cache_dir=str(cache / 'hub'),
                                    ignore_patterns=['*.gguf', '*.bin', '*.onnx', '*.h5', '*.msgpack'])
-    manifest = {'dataset': 'hotpotqa/hotpot_qa', 'config': 'distractor', 'split': 'validation',
+    embedding_path = snapshot_download(args.embedding_model, revision=embedding_revision, cache_dir=str(cache / 'hub'),
+        ignore_patterns=['*.gguf', '*.bin', '*.onnx', '*.h5', '*.msgpack'])
+    manifest = {'embedding_model': args.embedding_model, 'embedding_revision': embedding_revision,
+        'embedding_path': embedding_path, 'embedding_config_hash': digest(Path(embedding_path) / 'config.json'), 'dataset': 'hotpotqa/hotpot_qa', 'config': 'distractor', 'split': 'validation',
         'dataset_revision': revision, 'model': args.model, 'model_revision': model_revision,
         'model_path': model_path, 'seed': args.seed, 'query_count': len(queries), 'document_count': len(documents),
         'corpus_scope': 'union of contexts from sampled validation queries; not full Wikipedia',
@@ -158,6 +162,10 @@ def evaluate(args):
     manifest = validate_prepared(data)
     if args.model != manifest['model']:
         raise ValueError('Model must match prepared snapshot')
+    if args.embedding_model != manifest.get('embedding_model'):
+        raise ValueError('Embedding model must match prepared snapshot; prepare a fresh run for the new retriever')
+    if digest(Path(manifest['embedding_path']) / 'config.json') != manifest['embedding_config_hash']:
+        raise ValueError('Embedding model config hash mismatch')
     documents = read_jsonl(data / 'documents.jsonl')
     queries = read_jsonl(data / 'queries.jsonl')[:args.limit]
     if args.judge_batch_size < 1:
@@ -167,7 +175,8 @@ def evaluate(args):
     out = Path(args.output).resolve()
     out.mkdir(parents=True, exist_ok=True)
     config = {'manifest_hash': digest(data / 'manifest.json'), 'model_revision': manifest['model_revision'],
-        'model': args.model, 'device': args.device, 'top_k': args.top_k, 'bundle_size': args.bundle_size,
+        'embedding_model': args.embedding_model, 'embedding_revision': manifest['embedding_revision'],
+        'embedding_config_hash': manifest['embedding_config_hash'], 'model': args.model, 'device': args.device, 'top_k': args.top_k, 'bundle_size': args.bundle_size,
         'max_tokens': args.max_tokens, 'limit': args.limit, 'weights': args.weights, 'contextual': args.contextual,
         'max_bundles': args.max_bundles, 'judge_batch_size': args.judge_batch_size,
         'prefix_cache': not args.no_prefix_cache, 'code_hash': digest(Path(__file__)) + digest(Path(__file__).with_name('__init__.py'))}
@@ -178,14 +187,21 @@ def evaluate(args):
         if any(out.iterdir()):
             raise ValueError('Nonempty output; use --resume only for compatible results')
         atomic_json(out / 'config.json', config)
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
     path = manifest['model_path']
     tokenizer = AutoTokenizer.from_pretrained(path, local_files_only=True)
     dtype = torch.float32 if args.device == 'cpu' else torch.float16
     model = AutoModelForCausalLM.from_pretrained(path, local_files_only=True, dtype=dtype).to(args.device)
     if sum(p.numel() for p in model.parameters()) >= 9_000_000_000:
         raise ValueError('Model must have fewer than 9B parameters')
-    runner = Search(model, tokenizer, args.device, args.max_tokens, args.contextual, args.judge_batch_size, not args.no_prefix_cache)
+    embedding_tokenizer = AutoTokenizer.from_pretrained(manifest['embedding_path'], local_files_only=True)
+    embedding_model = AutoModel.from_pretrained(manifest['embedding_path'], local_files_only=True, dtype=dtype).to(args.device)
+    if sum(p.numel() for p in embedding_model.parameters()) >= 9_000_000_000:
+        raise ValueError('Embedding model must have fewer than 9B parameters')
+    if embedding_model.config.hidden_size != model.get_input_embeddings().weight.shape[1]:
+        raise ValueError('Embedding model width must match judge input width; no trained adapter is available')
+    retriever = EmbeddingRetriever(embedding_model, embedding_tokenizer, args.device, args.max_tokens)
+    runner = Search(model, tokenizer, args.device, args.max_tokens, False, args.judge_batch_size, not args.no_prefix_cache, retriever)
     notify_started()
     runner.sync()
     t0 = time.perf_counter()
@@ -231,12 +247,15 @@ def main():
     prep.add_argument('--model', default='Qwen/Qwen3-4B')
     prep.add_argument('--dataset-revision', default='main')
     prep.add_argument('--model-revision', default='main')
+    prep.add_argument('--embedding-model', default='Qwen/Qwen3-Embedding-4B')
+    prep.add_argument('--embedding-revision', default='main')
     prep.add_argument('--limit', type=int, default=200)
     prep.add_argument('--seed', type=int, default=17)
     ev = sub.add_parser('evaluate')
     ev.add_argument('--data', required=True)
     ev.add_argument('--output', required=True)
     ev.add_argument('--model', default='Qwen/Qwen3-4B')
+    ev.add_argument('--embedding-model', default='Qwen/Qwen3-Embedding-4B')
     ev.add_argument('--device', choices=['cpu', 'cuda', 'mps'], default='cuda')
     ev.add_argument('--top-k', type=int, default=5)
     ev.add_argument('--bundle-size', type=int, default=2)
